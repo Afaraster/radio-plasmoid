@@ -20,6 +20,7 @@ PlasmoidItem {
     property string errText: ""
     property string nowPlaying: ""
     property bool searching: false
+    property var _xhr: null
 
     preferredRepresentation: fullRepresentation
 
@@ -83,8 +84,10 @@ PlasmoidItem {
             player.play();
     }
 
-    function doSearch() {
-        var text = searchField.text.trim();
+    // 注意：fullRepresentation 的类型是 Component，它内部的 id（searchField）在 root 这层
+    // 不可见 —— 所以输入框的文本必须由调用方传进来，不能在这里直接读 searchField。
+    function doSearch(text) {
+        text = String(text || "").trim();
         if (text.length === 0) {
             root.errText = "请输入关键词，例如 新闻 / jazz / house";
             return;
@@ -95,7 +98,7 @@ PlasmoidItem {
         root.errText = "";
         root.statusText = "正在搜索「" + text + "」…";
 
-        var xhr = new XMLHttpRequest();
+        var xhr = root._xhr = new XMLHttpRequest();   // 挂到 root 上，避免请求飞行中被回收
         var url = root.directoryApi + "?name=" + encodeURIComponent(text)
                 + "&limit=60&hidebroken=true&order=votes&reverse=true";
         xhr.open("GET", url);
@@ -163,12 +166,12 @@ PlasmoidItem {
                     id: searchField
                     Layout.fillWidth: true
                     placeholderText: "搜索电台：新闻 / jazz / house …"
-                    onAccepted: root.doSearch()
+                    onAccepted: root.doSearch(searchField.text)
                 }
                 QQC.Button {
                     text: root.searching ? "…" : "搜索"
                     enabled: !root.searching
-                    onClicked: root.doSearch()
+                    onClicked: root.doSearch(searchField.text)
                 }
             }
 
