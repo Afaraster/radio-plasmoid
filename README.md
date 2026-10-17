@@ -2,6 +2,8 @@
 
 在 KDE Plasma 6 上听网络电台的极简组件：新闻 / 音乐 / 收藏三页预置频道，加一个搜索框和几个筛选按钮。
 
+![截图](assets/screenshot.png)
+
 从零自建，不依赖 Hermes 桌面端，也不引入任何额外进程 —— 音频在 `plasmashell` 进程内由
 QtMultimedia 播放，搜索是一次 `XMLHttpRequest`，全部代码就是一个 QML 文件。
 
