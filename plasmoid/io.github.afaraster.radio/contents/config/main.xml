@@ -18,6 +18,18 @@
       <label>上次停留的标签页</label>
       <default>news</default>
     </entry>
+    <entry name="tabs" type="String">
+      <label>标签页与频道（JSON）</label>
+      <default>[]</default>
+    </entry>
+    <entry name="customTabs" type="String">
+      <label>自定义标签页（JSON）</label>
+      <default>[]</default>
+    </entry>
+    <entry name="lastStation" type="String">
+      <label>上次播放的电台（JSON）</label>
+      <default></default>
+    </entry>
     <entry name="volume" type="Double">
       <label>音量</label>
       <default>0.8</default>
