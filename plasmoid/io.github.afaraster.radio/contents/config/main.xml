@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 组件持久化：收藏、搜索历史、音量、上次停留的标签页。 -->
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+                          http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="favorites" type="String">
+      <label>收藏的电台（JSON）</label>
+      <default>[]</default>
+    </entry>
+    <entry name="history" type="String">
+      <label>最近的搜索词（JSON）</label>
+      <default>[]</default>
+    </entry>
+    <entry name="lastTab" type="String">
+      <label>上次停留的标签页</label>
+      <default>news</default>
+    </entry>
+    <entry name="volume" type="Double">
+      <label>音量</label>
+      <default>0.8</default>
+      <min>0</min>
+      <max>1</max>
+    </entry>
+  </group>
+</kcfg>

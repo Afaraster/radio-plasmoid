@@ -2,3 +2,5 @@
 *.jsc
 __pycache__/
 *.swp
+screenshot*.png
+*.bak-*
