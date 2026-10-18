@@ -7,14 +7,26 @@
 # PulseAudio 的 module-stream-restore 只记忆"应用自己选过的设备"，管不住这种
 # 应用显式指定的情况，所以需要这一层兜底。
 #
-# 幂等：已经在默认设备上时移动是无副作用的空操作。找不到流时静默退出。
+# 注意：必须解析 `pactl list sink-inputs` 的详细格式 —— short 格式里没有应用名。
+# 幂等：已经在默认设备上时移动是无副作用的空操作。
 set -u
 
 default="$(pactl get-default-sink 2>/dev/null || true)"
 [ -n "${default:-}" ] || { echo "radio-follow-default: 取不到默认输出设备，跳过"; exit 0; }
 
-ids="$(pactl list sink-inputs short 2>/dev/null | awk '$0 ~ /plasmashell/ {print $1}')"
-[ -n "${ids:-}" ] || { echo "radio-follow-default: 没有 plasmashell 的音频流"; exit 0; }
+# 播放刚开始时音频流可能还没建立，等最多 6 秒
+ids=""
+for _ in $(seq 1 12); do
+    ids="$(pactl list sink-inputs 2>/dev/null | awk -v RS='' '
+        $0 ~ /application.name = "plasmashell"/ {
+            if (match($0, /Sink Input #[0-9]+/))
+                print substr($0, RSTART + 12, RLENGTH - 12)
+        }')"
+    [ -n "$ids" ] && break
+    sleep 0.5
+done
+
+[ -n "$ids" ] || { echo "radio-follow-default: 没有 plasmashell 的音频流"; exit 0; }
 
 moved=0
 for id in $ids; do
