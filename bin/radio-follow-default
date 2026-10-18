@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# 把 plasmashell 自己的音频流拨回「系统默认输出设备」。
+#
+# 为什么需要它：Qt 在组件初始化时记住当时的默认输出设备，而开机时 plasmashell
+# 通常比蓝牙耳机连上得早，于是 Qt 记下的是内置声卡，之后创建音频流时显式指定
+# 那个设备 —— 声音就进了内置声卡，即使系统默认已经是耳机。
+# PulseAudio 的 module-stream-restore 只记忆"应用自己选过的设备"，管不住这种
+# 应用显式指定的情况，所以需要这一层兜底。
+#
+# 幂等：已经在默认设备上时移动是无副作用的空操作。找不到流时静默退出。
+set -u
+
+default="$(pactl get-default-sink 2>/dev/null || true)"
+[ -n "${default:-}" ] || { echo "radio-follow-default: 取不到默认输出设备，跳过"; exit 0; }
+
+ids="$(pactl list sink-inputs short 2>/dev/null | awk '$0 ~ /plasmashell/ {print $1}')"
+[ -n "${ids:-}" ] || { echo "radio-follow-default: 没有 plasmashell 的音频流"; exit 0; }
+
+moved=0
+for id in $ids; do
+    if pactl move-sink-input "$id" "$default" 2>/dev/null; then
+        moved=$((moved + 1))
+    fi
+done
+echo "radio-follow-default: 已把 $moved 条流移到 $default"

@@ -6,6 +6,7 @@ import QtQuick.Controls as QQC
 import QtQuick.Layouts
 import QtMultimedia
 import org.kde.plasma.plasmoid
+import org.kde.plasma.plasma5support as P5Support
 import org.kde.kirigami as Kirigami
 
 PlasmoidItem {
@@ -45,6 +46,27 @@ PlasmoidItem {
 
     switchWidth: Kirigami.Units.gridUnit * 14
     switchHeight: Kirigami.Units.gridUnit * 14
+
+    // 兜底：Qt 会记住组件初始化时的默认输出设备（开机时蓝牙往往还没连上），
+    // 之后创建音频流时显式指定它，声音就进了内置声卡。
+    // 播放后一秒调用一次脚本，把 plasmashell 的流拨回系统默认设备。
+    P5Support.DataSource {
+        id: routeFix
+        engine: "executable"
+        connectedSources: []
+
+        onNewData: function (sourceName, data) {
+            routeFix.disconnectSource(sourceName);
+            console.log("[radio] " + String(data["stdout"] || "").trim());
+        }
+    }
+
+    Timer {
+        id: routeFixTimer
+        interval: 1500
+        repeat: false
+        onTriggered: routeFix.connectSource("sh -c \"exec $HOME/.local/bin/radio-follow-default\"")
+    }
 
     ListModel { id: favModel }
     ListModel { id: searchModel }
@@ -309,6 +331,19 @@ PlasmoidItem {
 
     // ---------- 播放 ----------
 
+    // Qt 会记住组件初始化那一刻的默认输出设备，而 plasmashell 启动通常早于蓝牙连接，
+    // 于是流被显式送到内置声卡。每次播放前重新取一次系统默认设备。
+    function refreshOutputDevice() {
+        var d = MediaDevices.defaultAudioOutput;
+        var cur = audioOut.device ? audioOut.device.description : "none";
+        console.log("[radio] devices: default=" + (d ? d.description : "undefined")
+                    + " | current=" + cur);
+        if (d && d.description !== cur) {
+            audioOut.device = d;
+            console.log("[radio] audioOutput.device -> " + d.description);
+        }
+    }
+
     function playStation(name, url) {
         console.log("[radio] playStation name=" + name + " url=" + url
                     + " vol=" + audioOut.volume
@@ -317,9 +352,11 @@ PlasmoidItem {
         root.nowPlaying = name;
         root.lastStation = { "name": name, "url": url };
         root.persist();
+        root.refreshOutputDevice();
         player.stop();
         player.source = url;
         player.play();
+        routeFixTimer.restart();
         console.log("[radio] after play -> state=" + player.playbackState
                     + " mediaStatus=" + player.mediaStatus
                     + " source=" + player.source
@@ -332,12 +369,15 @@ PlasmoidItem {
             return;
         }
         // 刚启动时 source 为空，用记住的台补上，重启后第一次点播放就能接着播
+        root.refreshOutputDevice();
         if (player.source == "" && root.lastStation) {
             root.nowPlaying = root.lastStation.name;
             player.source = root.lastStation.url;
         }
-        if (player.source != "")
+        if (player.source != "") {
             player.play();
+            routeFixTimer.restart();
+        }
     }
 
     // ---------- 搜索 ----------
