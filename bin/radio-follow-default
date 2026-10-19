@@ -1,37 +1,77 @@
 #!/usr/bin/env bash
 # 把 plasmashell 自己的音频流拨回「系统默认输出设备」。
 #
-# 为什么需要它：Qt 在组件初始化时记住当时的默认输出设备，而开机时 plasmashell
-# 通常比蓝牙耳机连上得早，于是 Qt 记下的是内置声卡，之后创建音频流时显式指定
-# 那个设备 —— 声音就进了内置声卡，即使系统默认已经是耳机。
-# PulseAudio 的 module-stream-restore 只记忆"应用自己选过的设备"，管不住这种
-# 应用显式指定的情况，所以需要这一层兜底。
+# 为什么需要它：Qt 在组件初始化时记住当时的默认输出设备，而 plasmashell 通常
+# 比蓝牙耳机连上得早，于是 Qt 记下的是内置声卡，之后创建音频流时显式指定那个
+# 设备 —— 声音就进了内置声卡，即使系统默认已经是耳机。PulseAudio 的
+# module-stream-restore 只记忆「应用自己选过的设备」，module-switch-on-connect
+# 只在设备接入那一刻搬流，都管不住「流建立时显式指定了旧设备」这种情况。
 #
-# 注意：必须解析 `pactl list sink-inputs` 的详细格式 —— short 格式里没有应用名。
-# 幂等：已经在默认设备上时移动是无副作用的空操作。
+# 两个必须遵守的细节（都踩过）：
+#  1. 不能解析 `pactl list sink-inputs` 的文本 —— 中文 locale 下段落标题是
+#     「信宿输入 #17」，匹配 "Sink Input #N" 永远失败。改用 `pactl -f json`
+#     （pactl 17 起支持），与语言无关。
+#  2. 等待窗口要够长：网络电台要先填缓冲才真正建立 pulse 流，实测可达 15 s。
+#     默认轮询 60 s，可用第一个参数覆盖（秒）。
+#
+# 用法：radio-follow-default [等待秒数]
+# 幂等：已经挂在默认设备上的流不会被重复搬动；永不返回非 0。
 set -u
 
-default="$(pactl get-default-sink 2>/dev/null || true)"
-[ -n "${default:-}" ] || { echo "radio-follow-default: 取不到默认输出设备，跳过"; exit 0; }
+WAIT="${1:-60}"
+STEP=0.5
 
-# 播放刚开始时音频流可能还没建立，等最多 6 秒
-ids=""
-for _ in $(seq 1 12); do
-    ids="$(pactl list sink-inputs 2>/dev/null | awk -v RS='' '
-        $0 ~ /application.name = "plasmashell"/ {
-            if (match($0, /Sink Input #[0-9]+/))
-                print substr($0, RSTART + 12, RLENGTH - 12)
-        }')"
-    [ -n "$ids" ] && break
-    sleep 0.5
-done
+fail() { echo "radio-follow-default: $*"; exit 0; }
 
-[ -n "$ids" ] || { echo "radio-follow-default: 没有 plasmashell 的音频流"; exit 0; }
+command -v pactl >/dev/null 2>&1 || fail "没有 pactl"
+command -v python3 >/dev/null 2>&1 || fail "没有 python3"
 
-moved=0
-for id in $ids; do
-    if pactl move-sink-input "$id" "$default" 2>/dev/null; then
-        moved=$((moved + 1))
+PY='
+import json, sys
+mode = sys.argv[1]
+raw = sys.stdin.read()
+try:
+    data = json.loads(raw) if raw.strip() else []
+except Exception:
+    data = []
+if mode == "sinks":
+    for s in data:
+        print(s.get("index"), s.get("name"))
+else:
+    for i in data:
+        p = i.get("properties") or {}
+        if (p.get("application.name") == "plasmashell"
+                or p.get("application.process.binary") == "plasmashell"
+                or p.get("application.id") == "org.kde.plasmashell"):
+            print(i.get("index"), i.get("sink"))
+'
+
+deadline=$(( $(date +%s) + WAIT ))
+
+while :; do
+    default_name="$(pactl get-default-sink 2>/dev/null)"
+    [ -n "${default_name:-}" ] || fail "取不到默认输出设备，跳过"
+
+    default_idx="$(pactl -f json list sinks 2>/dev/null \
+        | python3 -c "$PY" sinks \
+        | awk -v n="$default_name" '$2 == n {print $1; exit}')"
+    [ -n "${default_idx:-}" ] || fail "默认设备 $default_name 不在 sink 列表里"
+
+    inputs="$(pactl -f json list sink-inputs 2>/dev/null | python3 -c "$PY" inputs)"
+    if [ -n "${inputs:-}" ]; then
+        moved=0
+        while read -r id cur_sink; do
+            [ -n "${id:-}" ] || continue
+            [ "${cur_sink:-}" = "$default_idx" ] && continue
+            if pactl move-sink-input "$id" "$default_idx" 2>/dev/null; then
+                moved=$((moved + 1))
+                echo "radio-follow-default: 流 #$id 由 sink ${cur_sink:-?} 移到 $default_idx ($default_name)"
+            fi
+        done <<< "$inputs"
+        [ "$moved" -eq 0 ] && echo "radio-follow-default: 流已在默认设备 $default_name"
+        exit 0
     fi
+
+    [ "$(date +%s)" -ge "$deadline" ] && fail "等了 ${WAIT}s 仍没有 plasmashell 的音频流"
+    sleep "$STEP"
 done
-echo "radio-follow-default: 已把 $moved 条流移到 $default"

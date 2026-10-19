@@ -111,8 +111,13 @@ PlasmoidItem {
 
         onPlaybackStateChanged: function (state) {
             console.log("[radio] playbackState -> " + state);
-            if (state === MediaPlayer.PlayingState)
+            // 真正进入播放时再兜一次：网络电台要先填缓冲才建立 pulse 流，
+            // play() 之后立刻跑的那一次可能等不到流（脚本最长等 60s，但这里
+            // 补一次触发，覆盖流建立比较晚的情况）。
+            if (state === MediaPlayer.PlayingState) {
+                routeFixTimer.restart();
                 root.statusText = "播放中";
+            }
             else if (state === MediaPlayer.PausedState)
                 root.statusText = "已暂停";
             else
