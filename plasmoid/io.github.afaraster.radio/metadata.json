@@ -8,14 +8,14 @@
             }
         ],
         "Category": "Multimedia",
-        "Description": "Minimal internet radio: preset stations and keyword search",
-        "Description[zh_CN]": "极简网络电台：预置频道 + 关键词搜索",
+        "Description": "Internet radio and NetEase Cloud Music search and playback",
+        "Description[zh_CN]": "网络电台与网易云音乐：搜索、播放、收藏",
         "Icon": "applications-multimedia",
         "Id": "io.github.afaraster.radio",
         "License": "MIT",
         "Name": "Radio",
         "Name[zh_CN]": "电台",
-        "Version": "0.1.0",
+        "Version": "0.2.0",
         "Website": "https://github.com/Afaraster/radio-plasmoid"
     }
 }

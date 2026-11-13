@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Small JSON adapter for the official ncm-cli; never exposes credentials/stream URLs."""
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+
+SONG = re.compile(r"^ncm://([0-9a-fA-F]{32})/([0-9]{1,20})$")
+
+
+class NcmError(Exception):
+    pass
+
+
+class NoJsonError(NcmError):
+    pass
+
+
+def public_error(message):
+    text = str(message or "网易云请求失败")
+    text = re.sub(r"https?://\S+", "[链接]", text)
+    text = re.sub(r"[A-Za-z0-9_+/=-]{32,}", "[已隐藏]", text)
+    return text[:250]
+
+
+def cli(*args):
+    env = os.environ.copy()
+    env["PATH"] = str(Path.home() / ".local/bin") + os.pathsep + env.get("PATH", "")
+    executable = shutil.which("ncm-cli", path=env["PATH"])
+    if not executable:
+        raise NcmError("未安装 ncm-cli，请先运行 npm install -g @music163/ncm-cli")
+    if "--output" not in args:
+        args = (*args, "--output", "json")
+    try:
+        result = subprocess.run([executable, *map(str, args)], capture_output=True,
+                                text=True, timeout=45, env=env)
+    except subprocess.TimeoutExpired:
+        raise NcmError("网易云请求超时，请重试") from None
+    # Some CLI versions print a diagnostic line before their JSON response.
+    payload = None
+    for index, char in enumerate(result.stdout):
+        if char != "{":
+            continue
+        try:
+            value, end = json.JSONDecoder().raw_decode(result.stdout[index:])
+            if not result.stdout[index + end:].strip() and isinstance(value, dict):
+                payload = value
+                break
+        except ValueError:
+            continue
+    if payload is None:
+        diagnostic = result.stdout + result.stderr
+        if "请求总量超限" in diagnostic:
+            raise NcmError("请求总量超限")
+        if "API key" in diagnostic:
+            raise NcmError("请在终端运行 ncm-cli configure，配置 appId 和 privateKey")
+        if "unknown command" in diagnostic:
+            raise NcmError("网易云命令表尚未就绪，请确认 ncm-cli 已配置并登录后重试")
+        error = NoJsonError if result.returncode == 0 else NcmError
+        raise error("网易云 CLI 未返回有效 JSON，请在终端检查 ncm-cli login --check")
+    if result.returncode or payload.get("success") is False or payload.get("code", 200) != 200:
+        raise NcmError(public_error(payload.get("message") or payload.get("msg") or "网易云请求失败"))
+    return payload
+
+
+def search(query):
+    query = query.strip()
+    if not query or len(query) > 300:
+        raise NcmError("请输入 1–300 字的歌曲或歌手名称")
+    response = cli("search", "song", "--keyword", query, "--limit", 60,
+                   "--userInput", "在桌面挂件搜索歌曲：" + query, "--output", "json")
+    data = response.get("data") or {}
+    rows = data.get("records")
+    if not isinstance(rows, list):
+        raise NcmError("网易云搜索结果格式发生变化，请更新挂件")
+    songs, seen, unavailable = [], set(), 0
+    for row in rows:
+        if row.get("visible") is False or row.get("playFlag") is False:
+            unavailable += 1
+            continue
+        url = "ncm://{}/{}".format(row.get("id", ""), row.get("originalId", ""))
+        if not SONG.fullmatch(url) or url in seen or not row.get("name"):
+            continue
+        seen.add(url)
+        artists = " / ".join(a["name"] for a in (row.get("artists") or []) if a.get("name"))
+        name = str(row["name"]) + (" — " + artists if artists else "")
+        songs.append({"name": name, "url": url})
+    return {"songs": songs, "unavailable": unavailable}
+
+
+def volume(value):
+    try:
+        number = float(value)
+    except ValueError:
+        raise NcmError("音量无效") from None
+    if not 0 <= number <= 100:
+        raise NcmError("音量必须在 0–100 之间")
+    return round(number)
+
+
+def mpv_state():
+    """Read only playback properties; CLI 0.1.7 reports paused mpv as stopped."""
+    path = Path.home() / ".config/ncm-cli/mpv.sock"
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1)
+            client.connect(str(path))
+            reader = client.makefile("rb")
+            values = {}
+            for request_id, key in enumerate(("idle-active", "pause", "time-pos"), 1):
+                request = {"command": ["get_property", key], "request_id": request_id}
+                client.sendall((json.dumps(request) + "\n").encode())
+                while True:
+                    line = reader.readline(65536)
+                    if not line:
+                        return None
+                    response = json.loads(line)
+                    if response.get("request_id") == request_id:
+                        if response.get("error") != "success" and key != "time-pos":
+                            return None
+                        values[key] = response.get("data")
+                        break
+            return {"status": "stopped" if values["idle-active"] else
+                    "paused" if values["pause"] else "playing",
+                    "position": values["time-pos"] or 0}
+    except (OSError, ValueError):
+        return None
+
+
+def main(args):
+    if not args:
+        raise NcmError("缺少命令")
+    action = args[0]
+    if action == "search" and len(args) == 2:
+        return search(args[1])
+    if action == "play" and len(args) == 3:
+        match = SONG.fullmatch(args[1])
+        if not match:
+            raise NcmError("歌曲 ID 无效，请重新搜索")
+        level = volume(args[2])
+        command = ("play", "--song", "--encrypted-id", match[1], "--original-id", match[2])
+        try:
+            cli(*command)
+        except NoJsonError:
+            # 0.1.7 can exit without JSON while starting its playback service.
+            # Repeat the same idempotent play request once after that startup.
+            cli(*command)
+        cli("volume", level)
+        return {}
+    if action == "volume" and len(args) == 2:
+        cli("volume", volume(args[1]))
+        return {}
+    if action in ("pause", "resume", "stop", "state") and len(args) == 1:
+        if action == "state":
+            actual = mpv_state()
+            if actual is not None:
+                return actual
+        response = cli(action)
+        if action == "state":
+            state = response.get("state") or {}
+            return {"status": state.get("status", "stopped"),
+                    "position": state.get("position", 0)}
+        return {}
+    raise NcmError("不支持的命令")
+
+
+if __name__ == "__main__":
+    try:
+        print(json.dumps({"ok": True, **main(sys.argv[1:])}, ensure_ascii=False))
+    except (NcmError, OSError, ValueError, TypeError) as exc:
+        print(json.dumps({"ok": False, "error": public_error(exc)}, ensure_ascii=False))
+        sys.exit(1)

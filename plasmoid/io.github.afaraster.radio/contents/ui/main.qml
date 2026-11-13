@@ -1,5 +1,5 @@
 // 极简电台挂件 —— 可编辑标签页 + 关键词/筛选搜索。
-// 播放走 QtMultimedia（Debian 的 Qt 6.8 用 FFmpeg 后端），搜索是一次 XMLHttpRequest。
+// 电台走 QtMultimedia；网易云通过官方 ncm-cli 搜索和控制 mpv。
 // 全部状态存在 plasmoid.configuration（见 contents/config/main.xml）。
 import QtQuick
 import QtQuick.Controls as QQC
@@ -31,6 +31,17 @@ PlasmoidItem {
     // ---- 搜索筛选 ----
     property string countryFilter: ""
     property string tagFilter: ""
+    property string searchSource: "ncm"
+    property int searchGeneration: 0
+    property int playGeneration: 0
+    property bool ncmActive: false
+    property string ncmState: "stopped"
+    property bool ncmStarting: false
+    property int ncmStartPolls: 0
+    property var ncmJobs: []
+    property var ncmJob: null
+    readonly property bool isPlaying: ncmActive ? ncmState === "playing"
+                                              : player.playbackState === MediaPlayer.PlayingState
 
     // ---- 界面状态 ----
     property bool expanded: false
@@ -66,6 +77,111 @@ PlasmoidItem {
         interval: 1500
         repeat: false
         onTriggered: routeFix.connectSource("sh -c \"exec $HOME/.local/bin/radio-follow-default\"")
+    }
+
+    // 参数逐项作 shell 引号处理，搜索词不作为命令执行。
+    function shellQuote(value) {
+        return "'" + String(value).replace(/'/g, "'\\''") + "'";
+    }
+
+    function ncmCommand(args) {
+        return '"$HOME/.local/bin/radio-ncm" ' + args.map(root.shellQuote).join(" ");
+    }
+
+    P5Support.DataSource {
+        id: ncmSearch
+        engine: "executable"
+        connectedSources: []
+        property var requests: ({})
+        onNewData: function(sourceName, data) {
+            ncmSearch.disconnectSource(sourceName);
+            var request = requests[sourceName];
+            delete requests[sourceName];
+            if (!request || request.generation !== root.searchGeneration)
+                return;
+            root.searching = false;
+            var result = root.ncmResult(data);
+            if (!result.ok) {
+                root.errText = result.error;
+                root.statusText = "搜索失败";
+                return;
+            }
+            searchModel.clear();
+            for (var i = 0; i < result.songs.length; i++)
+                searchModel.append(result.songs[i]);
+            root.activeView = "search";
+            root.rememberQuery("ncm:" + request.query);
+            root.statusText = "找到 " + result.songs.length + " 首歌曲"
+                    + (result.unavailable ? "（另有 " + result.unavailable + " 首暂无播放权限）" : "");
+        }
+    }
+
+    function ncmResult(data) {
+        try { return JSON.parse(String(data["stdout"] || "")); }
+        catch (e) { return {ok: false, error: "网易云桥接失败，请重新运行项目的 install.sh"}; }
+    }
+
+    // 播控串行执行，避免播放尚未完成时停止/换台被旧请求覆盖。
+    function enqueueNcm(args, callback) {
+        var jobs = root.ncmJobs.slice();
+        jobs.push({args: args, callback: callback});
+        root.ncmJobs = jobs;
+        root.runNcmJob();
+    }
+
+    function runNcmJob() {
+        if (root.ncmJob || root.ncmJobs.length === 0)
+            return;
+        var jobs = root.ncmJobs.slice();
+        root.ncmJob = jobs.shift();
+        root.ncmJobs = jobs;
+        ncmControl.connectSource(root.ncmCommand(root.ncmJob.args));
+    }
+
+    P5Support.DataSource {
+        id: ncmControl
+        engine: "executable"
+        connectedSources: []
+        onNewData: function(sourceName, data) {
+            ncmControl.disconnectSource(sourceName);
+            var job = root.ncmJob;
+            root.ncmJob = null;
+            if (job && job.callback)
+                job.callback(root.ncmResult(data));
+            root.runNcmJob();
+        }
+    }
+
+    Timer {
+        interval: 2000
+        repeat: true
+        running: root.ncmActive && (root.ncmStarting || root.ncmState === "playing" || root.ncmState === "paused")
+        onTriggered: {
+            if (root.ncmJob || root.ncmJobs.length > 0)
+                return;
+            var generation = root.playGeneration;
+            root.enqueueNcm(["state"], function(result) {
+                if (generation !== root.playGeneration || !root.ncmActive)
+                    return;
+                if (!result.ok) { root.errText = result.error; return; }
+                root.ncmState = result.status;
+                if (root.ncmStarting && result.status !== "playing") {
+                    root.ncmStartPolls++;
+                    if (root.ncmStartPolls < 15)
+                        return;
+                    root.errText = "网易云未能开始播放，请检查账号权限或重新登录";
+                }
+                root.ncmStarting = false;
+                root.statusText = result.status === "playing" ? "播放中"
+                                : result.status === "paused" ? "已暂停" : "已停止";
+            });
+        }
+    }
+
+    Timer {
+        id: ncmVolumeTimer
+        interval: 250
+        onTriggered: if (root.ncmActive) root.enqueueNcm(["volume", Math.round(audioOut.volume * 100)])
     }
 
     ListModel { id: favModel }
@@ -110,6 +226,7 @@ PlasmoidItem {
         }
 
         onPlaybackStateChanged: function (state) {
+            if (root.ncmActive) return;
             console.log("[radio] playbackState -> " + state);
             // 真正进入播放时再兜一次：网络电台要先填缓冲才建立 pulse 流，
             // play() 之后立刻跑的那一次可能等不到流（脚本最长等 60s，但这里
@@ -125,6 +242,7 @@ PlasmoidItem {
         }
 
         onMediaStatusChanged: function (status) {
+            if (root.ncmActive) return;
             if (status === MediaPlayer.LoadingMedia)
                 root.statusText = "连接中…";
             else if (status === MediaPlayer.BufferingMedia)
@@ -134,6 +252,7 @@ PlasmoidItem {
         }
 
         onErrorOccurred: function (error, errorString) {
+            if (root.ncmActive) return;
             root.errText = "播放错误：" + errorString;
             root.statusText = "无法播放";
         }
@@ -153,6 +272,7 @@ PlasmoidItem {
     }
 
     function loadConfig() {
+        root.searchSource = String(plasmoid.configuration.searchSource || "ncm");
         try { root.favList = JSON.parse(plasmoid.configuration.favorites || "[]") || []; }
         catch (e) { root.favList = []; }
         try { root.histList = JSON.parse(plasmoid.configuration.history || "[]") || []; }
@@ -350,6 +470,10 @@ PlasmoidItem {
     }
 
     function playStation(name, url) {
+        var generation = ++root.playGeneration;
+        var wasNcm = root.ncmActive;
+        root.ncmStarting = false;
+        root.ncmActive = url.indexOf("ncm://") === 0;
         console.log("[radio] playStation name=" + name + " url=" + url
                     + " vol=" + audioOut.volume
                     + " device=" + (audioOut.device ? audioOut.device.description : "none"));
@@ -357,6 +481,37 @@ PlasmoidItem {
         root.nowPlaying = name;
         root.lastStation = { "name": name, "url": url };
         root.persist();
+        player.stop();
+        player.source = "";
+        if (root.ncmActive) {
+            routeFixTimer.stop();
+            root.ncmState = "stopped";
+            root.ncmStarting = true;
+            root.ncmStartPolls = 0;
+            root.statusText = "连接网易云…";
+            root.enqueueNcm(["play", url, Math.round(audioOut.volume * 100)], function(result) {
+                if (generation !== root.playGeneration) return;
+                if (!result.ok) {
+                    root.ncmStarting = false;
+                    root.errText = result.error;
+                    root.statusText = "无法播放";
+                }
+            });
+            return;
+        }
+        if (wasNcm || root.ncmJob || root.ncmJobs.length > 0) {
+            root.statusText = "切换到电台…";
+            root.enqueueNcm(["stop"], function(result) {
+                if (generation !== root.playGeneration) return;
+                if (!result.ok) { root.errText = result.error; return; }
+                root.startRadio(url);
+            });
+            return;
+        }
+        root.startRadio(url);
+    }
+
+    function startRadio(url) {
         root.refreshOutputDevice();
         player.stop();
         player.source = url;
@@ -369,20 +524,52 @@ PlasmoidItem {
     }
 
     function togglePlay() {
-        if (player.playbackState === MediaPlayer.PlayingState) {
+        if (root.ncmActive) {
+            if (root.ncmStarting) return;
+            if (root.ncmState === "stopped" && root.lastStation) {
+                root.playStation(root.lastStation.name, root.lastStation.url);
+                return;
+            }
+            var action = root.isPlaying ? "pause" : "resume";
+            var generation = root.playGeneration;
+            root.enqueueNcm([action], function(result) {
+                if (generation !== root.playGeneration) return;
+                if (!result.ok) { root.errText = result.error; return; }
+                root.ncmState = action === "pause" ? "paused" : "playing";
+                root.statusText = action === "pause" ? "已暂停" : "播放中";
+            });
+            return;
+        }
+        if (root.isPlaying) {
             player.pause();
             return;
         }
         // 刚启动时 source 为空，用记住的台补上，重启后第一次点播放就能接着播
         root.refreshOutputDevice();
         if (player.source == "" && root.lastStation) {
-            root.nowPlaying = root.lastStation.name;
-            player.source = root.lastStation.url;
+            root.playStation(root.lastStation.name, root.lastStation.url);
+            return;
         }
         if (player.source != "") {
             player.play();
             routeFixTimer.restart();
         }
+    }
+
+    function stopPlayback() {
+        var generation = ++root.playGeneration;
+        root.ncmStarting = false;
+        player.stop();
+        if (root.ncmActive) {
+            root.enqueueNcm(["stop"], function(result) {
+                if (generation !== root.playGeneration) return;
+                if (!result.ok) { root.errText = result.error; return; }
+                root.ncmState = "stopped";
+                root.ncmActive = false;
+                root.statusText = "已停止";
+            });
+        }
+        root.nowPlaying = "";
     }
 
     // ---------- 搜索 ----------
@@ -411,6 +598,9 @@ PlasmoidItem {
 
     // 清空搜索（输入框由调用方清，root 层看不到组件内的 id）
     function clearSearch() {
+        root.searchGeneration++;
+        root.searching = false;
+        if (root._xhr) { root._xhr.abort(); root._xhr = null; }
         root.countryFilter = "";
         root.tagFilter = "";
         root.errText = "";
@@ -422,7 +612,8 @@ PlasmoidItem {
 
     function doSearch(text) {
         text = String(text || "").trim();
-        if (text.length === 0 && root.countryFilter.length === 0 && root.tagFilter.length === 0) {
+        if (text.length === 0 && (root.searchSource === "ncm" ||
+                (root.countryFilter.length === 0 && root.tagFilter.length === 0))) {
             root.clearSearch();
             return;
         }
@@ -435,12 +626,20 @@ PlasmoidItem {
         root.searching = true;
         root.errText = "";
         root.statusText = "正在搜索…";
+        var generation = ++root.searchGeneration;
+        if (root.searchSource === "ncm") {
+            var command = root.ncmCommand(["search", text]) + " #" + generation;
+            ncmSearch.requests[command] = {generation: generation, query: text};
+            ncmSearch.connectSource(command);
+            return;
+        }
 
         var xhr = root._xhr = new XMLHttpRequest();
         xhr.open("GET", root.buildSearchUrl(text));
         xhr.onreadystatechange = function () {
             if (xhr.readyState !== XMLHttpRequest.DONE)
                 return;
+            if (generation !== root.searchGeneration) return;
             root.searching = false;
             if (xhr.status !== 200) {
                 root.errText = "目录请求失败：HTTP " + xhr.status;
@@ -470,6 +669,21 @@ PlasmoidItem {
         xhr.send();
     }
 
+    function setSearchSource(source) {
+        root.clearSearch();
+        root.searchSource = source;
+        plasmoid.configuration.searchSource = source;
+    }
+
+    function historyText(query) {
+        return query.indexOf("ncm:") === 0 ? "网易云：" + query.substring(4) : query;
+    }
+
+    function searchHistory(query) {
+        root.setSearchSource(query.indexOf("ncm:") === 0 ? "ncm" : "radio");
+        root.doSearch(query.indexOf("ncm:") === 0 ? query.substring(4) : query);
+    }
+
     toolTipMainText: "电台"
     toolTipSubText: root.nowPlaying.length > 0 ? (root.nowPlaying + "\n" + root.statusText) : root.statusText
 
@@ -493,10 +707,16 @@ PlasmoidItem {
                 Layout.fillWidth: true
                 spacing: Kirigami.Units.smallSpacing
 
+                QQC.ComboBox {
+                    model: ["网易云", "电台"]
+                    currentIndex: root.searchSource === "ncm" ? 0 : 1
+                    onActivated: root.setSearchSource(currentIndex === 0 ? "ncm" : "radio")
+                }
+
                 QQC.TextField {
                     id: searchField
                     Layout.fillWidth: true
-                    placeholderText: "搜索电台：新闻 / jazz / house …"
+                    placeholderText: root.searchSource === "ncm" ? "搜索歌曲 / 歌手 …" : "搜索电台：新闻 / jazz …"
                     onAccepted: root.doSearch(searchField.text)
                 }
                 QQC.Button {
@@ -516,6 +736,7 @@ PlasmoidItem {
 
             // ---- 筛选行 ----
             RowLayout {
+                visible: root.searchSource === "radio"
                 Layout.fillWidth: true
                 spacing: Kirigami.Units.smallSpacing
 
@@ -553,11 +774,11 @@ PlasmoidItem {
                 Repeater {
                     model: root.histList
                     delegate: QQC.Button {
-                        text: modelData
+                        text: root.historyText(modelData)
                         font.pointSize: 8
                         onClicked: {
-                            searchField.text = modelData;
-                            root.doSearch(modelData);
+                            searchField.text = modelData.indexOf("ncm:") === 0 ? modelData.substring(4) : modelData;
+                            root.searchHistory(modelData);
                         }
                     }
                 }
@@ -668,7 +889,7 @@ PlasmoidItem {
                 spacing: Kirigami.Units.smallSpacing
 
                 Kirigami.Icon {
-                    source: player.playbackState === MediaPlayer.PlayingState
+                    source: root.isPlaying
                             ? "media-playback-pause" : "media-playback-start"
                     implicitWidth: Kirigami.Units.iconSizes.small
                     implicitHeight: implicitWidth
@@ -684,16 +905,13 @@ PlasmoidItem {
                 }
                 QQC.Button {
                     text: "播放/暂停"
-                    enabled: player.source != ""
+                    enabled: root.lastStation !== null && !root.ncmStarting
                     onClicked: root.togglePlay()
                 }
                 QQC.Button {
                     text: "停止"
-                    enabled: player.source != ""
-                    onClicked: {
-                        player.stop();
-                        root.nowPlaying = "";
-                    }
+                    enabled: player.source != "" || root.ncmActive
+                    onClicked: root.stopPlayback()
                 }
             }
 
@@ -742,7 +960,7 @@ PlasmoidItem {
                         Text {
                             Layout.fillWidth: true
                             text: (root.nowPlaying === model.name
-                                   && player.playbackState === MediaPlayer.PlayingState)
+                                   && root.isPlaying)
                                   ? ("▶ " + model.name) : model.name
                             color: Kirigami.Theme.textColor
                             font.pointSize: 9
@@ -785,6 +1003,7 @@ PlasmoidItem {
                     Component.onCompleted: audioOut.volume = value
                     onValueChanged: audioOut.volume = value
                     onMoved: {
+                        if (root.ncmActive) ncmVolumeTimer.restart();
                         plasmoid.configuration.volume = value;
                         if (typeof plasmoid.configuration.writeConfig === "function")
                             plasmoid.configuration.writeConfig();
@@ -872,7 +1091,7 @@ PlasmoidItem {
 
                 Kirigami.Icon {
                     anchors.fill: parent
-                    source: player.playbackState === MediaPlayer.PlayingState
+                    source: root.isPlaying
                             ? "media-playback-pause" : "media-playback-start"
                 }
                 MouseArea {

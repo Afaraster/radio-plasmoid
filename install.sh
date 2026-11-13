@@ -8,6 +8,12 @@ BIN_DIR="$HOME/.local/bin"
 
 echo "==> 安装输出设备纠正脚本到 $BIN_DIR/radio-follow-default"
 install -Dm755 "$SRC/bin/radio-follow-default" "$BIN_DIR/radio-follow-default"
+install -Dm755 "$SRC/bin/radio-ncm" "$BIN_DIR/radio-ncm"
+
+if ! command -v ncm-cli >/dev/null 2>&1 && [ ! -x "$BIN_DIR/ncm-cli" ]; then
+    echo "网易云搜索需要官方 CLI：npm install -g @music163/ncm-cli"
+    echo "安装后运行 ncm-cli configure 和 ncm-cli login 完成配置及授权。"
+fi
 
 echo "==> 安装 Plasma 组件 $PLUGIN_ID"
 if command -v kpackagetool6 >/dev/null 2>&1; then
@@ -29,4 +35,5 @@ cat <<'EOF'
 卸载：
   rm -rf ~/.local/share/plasma/plasmoids/io.github.afaraster.radio
   rm -f  ~/.local/bin/radio-follow-default
+  rm -f  ~/.local/bin/radio-ncm
 EOF
